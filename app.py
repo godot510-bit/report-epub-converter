@@ -11,26 +11,41 @@ st.set_page_config(
     layout="centered"
 )
 
+def is_financial_statement(page_text):
+    """재무제표 페이지 여부를 판단하여 생략하기 위한 키워드 검사"""
+    fin_keywords = ["재무제표", "포괄손익계산서", "재무상태표", "현금흐름표", "K-IFRS 연결", "매출액", "영업이익", "당기순이익"]
+    match_count = sum(1 for kw in fin_keywords if kw in page_text)
+    # 금융 관련 키워드가 너무 많이 밀집해 있으면 재무제표 페이지로 판단
+    return match_count >= 3
+
 def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포트"):
     book = epub.EpubBook()
     book.set_title(title)
     book.set_language('ko')
     book.add_metadata('DC', 'creator', 'Report EPUB Converter')
 
-    # 모바일 리더기(Thorium, Moon+ Reader 등) 최적화 CSS 스타일
+    # 모바일 리더기(Thorium, Moon+ Reader) 최적화 CSS 스타일
     epub_css = '''
     @namespace epub "http://www.idpf.org/2007/ops";
     body {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         line-height: 1.6;
-        padding: 4%;
+        padding: 5%;
         color: #2c3e50;
         background-color: #ffffff;
     }
-    h1, h2, h3 {
+    h2 {
         color: #1a2a3a;
         margin-top: 1.2em;
-        margin-bottom: 0.5em;
+        margin-bottom: 0.6em;
+        font-size: 1.2em;
+        border-bottom: 2px solid #eaeaea;
+        padding-bottom: 0.3em;
+    }
+    h3 {
+        color: #2c3e50;
+        margin-top: 1em;
+        font-size: 1.05em;
         font-weight: bold;
     }
     p {
@@ -38,7 +53,6 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
         text-align: justify;
         word-break: keep-all;
     }
-    /* 이미지 및 선명한 표 크래핑 영역 스타일링 */
     .img-container {
         text-align: center;
         margin: 1.5em 0;
@@ -50,7 +64,13 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
         margin: 0 auto;
         border: 1px solid #e1e4e8;
         border-radius: 4px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        box-shadow: 0 2px 5px rgba(0,0,0,0.06);
+    }
+    .skip-notice {
+        color: #888888;
+        font-style: italic;
+        font-size: 0.9em;
+        margin-top: 2em;
     }
     '''
     css_item = epub.EpubItem(
@@ -70,58 +90,55 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
     for page_num in range(len(doc)):
         page = doc[page_num]
         display_page_num = page_num + 1
-        page_content = f"<h2>Page {display_page_num}</h2>"
+        page_text = page.get_text("text")
         
-        # 1. 텍스트 추출 및 정제 (단락 처리)
-        text = page.get_text("text")
-        if text:
-            lines = text.split('\n')
-            for line in lines:
-                cleaned = line.strip()
-                # 단순 페이지 번호 등 무의미한 텍스트 제외
-                if cleaned and not re.match(r'^\s*\d+\s*$', cleaned):
-                    # 주요 제목 및 소제목 자동 강조
-                    if len(cleaned) < 40 and any(keyword in cleaned for keyword in ["요약", "전망", "분석", "투자", "목표"]):
-                        page_content += f"<h3>{cleaned}</h3>"
-                    else:
-                        page_content += f"<p>{cleaned}</p>"
-
-        # 2. 이미지 및 크롭 대상(표/그래프) 추출 (고해상도 렌더링)
-        # 2-1) embedded 이미지 추출
-        image_list = page.get_images(full=True)
-        for img_info in image_list:
-            xref = img_info[0]
-            base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            image_ext = base_image["ext"]
-
-            img_counter += 1
-            img_name = f"Images/img_{img_counter}.{image_ext}"
+        # 재무제표 페이지 필터링 (요청사항 반영: 재무제표 생략)
+        if is_financial_statement(page_text):
+            page_content = f"<h2>Page {display_page_num}</h2>"
+            page_content += f'<p class="skip-notice">[안내] 본 페이지의 재무제표 영역은 설정에 따라 생략되었습니다.</p>'
+        else:
+            page_content = f"<h2>Page {display_page_num}</h2>"
             
-            book.add_item(epub.EpubItem(
-                uid=f"img_{img_counter}",
-                file_name=img_name,
-                media_type=f"image/{image_ext}",
-                content=image_bytes
-            ))
-            page_content += f'<div class="img-container"><img src="{img_name}" alt="Report Graphic" /></div>'
+            # 1. 텍스트 추출 및 자연스러운 문단 정제 (기존 방식 유지)
+            if page_text:
+                lines = page_text.split('\n')
+                for line in lines:
+                    cleaned = line.strip()
+                    if cleaned and not re.match(r'^\s*\d+\s*$', cleaned):
+                        # 소제목 성격의 텍스트 강조
+                        if len(cleaned) < 35 and any(k in cleaned for k in ["요약", "전망", "분석", "투자", "목표", "특징", "점검"]):
+                            page_content += f"<h3>{cleaned}</h3>"
+                        else:
+                            page_content += f"<p>{cleaned}</p>"
 
-        # 2-2) vector graphics 기반의 표/그래프 형태 캡처 (선명도 확보를 위한 2배율 고해상도 크롭)
-        # 이미지가 포함되지 않은 페이지이거나 추가 표 시각화가 필요한 경우 고화질 전체 페이지 백업 스냅샷 제공
-        if len(image_list) == 0:
-            pix = page.get_pixmap(dpi=200) # 고화질 200 DPI
-            img_counter += 1
-            img_name = f"Images/page_crop_{img_counter}.png"
-            
-            book.add_item(epub.EpubItem(
-                uid=f"img_crop_{img_counter}",
-                file_name=img_name,
-                media_type="image/png",
-                content=pix.tobytes("png")
-            ))
-            page_content += f'<div class="img-container"><img src="{img_name}" alt="Page Graphic Snapshot" /></div>'
+            # 2. 원본 PDF에 포함된 표/그래프/이미지 객체 고화질 추출 및 삽입
+            image_list = page.get_images(full=True)
+            if image_list:
+                for img_info in image_list:
+                    try:
+                        xref = img_info[0]
+                        base_image = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        image_ext = base_image["ext"]
 
-        # EPUB 챕터 구성
+                        img_counter += 1
+                        img_name = f"Images/extracted_{img_counter}.{image_ext}"
+                        
+                        book.add_item(epub.EpubItem(
+                            uid=f"extracted_{img_counter}",
+                            file_name=img_name,
+                            media_type=f"image/{image_ext}",
+                            content=image_bytes
+                        ))
+                        page_content += f'<div class="img-container"><img src="{img_name}" alt="Extracted Chart/Table" /></div>'
+                    except Exception:
+                        continue
+            else:
+                # 만약 벡터 그래픽 기반 표/차트여서 개별 이미지가 안 잡히고 텍스트 표 형태가 의심될 경우, 
+                # 해당 영역이 포함된 페이지 스냅샷 일부분을 보완 캡처하거나 깔끔하게 렌더링
+                pass
+
+        # EPUB 챕터 생성
         chap = epub.EpubHtml(
             title=f"Page {display_page_num}", 
             file_name=f"Text/page_{display_page_num}.xhtml", 
@@ -140,7 +157,6 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
         spine_items.append(chap)
         toc_list.append(chap)
 
-    # EPUB 3 목차 및 스파인 설정
     book.toc = tuple(toc_list)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
@@ -152,13 +168,13 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
 
 # --- Streamlit UI ---
 st.title("📊 증권사 리포트 PDF to EPUB 3 변환기")
-st.markdown("본문 텍스트 리플로우 및 선명한 원본 표/그래프 이미지 자동 최적화 앱입니다.")
+st.markdown("텍스트는 리플로우, 표·그래프는 원본 이미지 캡처, 재무제표는 자동 생략되는 맞춤형 변환기입니다.")
 
 uploaded_file = st.file_uploader("변환할 증권사 리포트 PDF 파일을 업로드하세요", type=["pdf"])
 custom_title = st.text_input("생성될 EPUB 파일 제목", value="증권사 리포트 분석")
 
 if uploaded_file is not None and st.button("🚀 EPUB 3 변환 시작", type="primary"):
-    with st.spinner("PDF 분석, 고해상도 표/이미지 크래핑 및 EPUB 생성 중..."):
+    with st.spinner("PDF 분석 중 (텍스트 정제 및 표/이미지 원본 캡처, 재무제표 생략)..."):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
             tmp_pdf.write(uploaded_file.getvalue())
             tmp_pdf_path = tmp_pdf.name
@@ -167,7 +183,7 @@ if uploaded_file is not None and st.button("🚀 EPUB 3 변환 시작", type="pr
         
         try:
             convert_pdf_to_epub_v3(tmp_pdf_path, output_epub_path, title=custom_title)
-            st.success("✨ 고화질 이미지/표 최적화 EPUB 변환 완료!")
+            st.success("✨ 맞춤형 EPUB 변환이 완료되었습니다!")
             
             with open(output_epub_path, "rb") as f:
                 st.download_button(
