@@ -23,53 +23,55 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
     book.set_language('ko')
     book.add_metadata('DC', 'creator', 'Report EPUB Converter')
 
-    # 모바일 리더기 최적화 CSS 스타일
+    # 판매용 EPUB 스타일 (깔끔한 여백과 반응형 이미지 래퍼)
     epub_css = '''
     @namespace epub "http://www.idpf.org/2007/ops";
     body {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        line-height: 1.6;
-        padding: 4%;
+        line-height: 1.65;
+        padding: 5%;
         color: #2c3e50;
         background-color: #ffffff;
     }
     h2 {
         color: #1a2a3a;
-        margin-top: 1.2em;
-        margin-bottom: 0.5em;
-        font-size: 1.15em;
+        margin-top: 1.4em;
+        margin-bottom: 0.6em;
+        font-size: 1.2em;
         border-bottom: 2px solid #eaeaea;
         padding-bottom: 0.3em;
     }
     h3 {
         color: #2c3e50;
-        margin-top: 1em;
+        margin-top: 1.1em;
         font-size: 1.05em;
         font-weight: bold;
     }
     p {
-        margin-bottom: 0.8em;
+        margin-bottom: 1em;
         text-align: justify;
         word-break: keep-all;
     }
     .img-container {
         text-align: center;
-        margin: 1.5em 0;
+        margin: 1.8em 0;
     }
     img {
         max-width: 100%;
         height: auto;
         display: block;
         margin: 0 auto;
-        border: 1px solid #e1e4e8;
+        border: 1px solid #d1d5db;
         border-radius: 6px;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.06);
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        background-color: #fff;
     }
     .skip-notice {
         color: #888888;
         font-style: italic;
         font-size: 0.9em;
         margin-top: 2em;
+        text-align: center;
     }
     '''
     css_item = epub.EpubItem(
@@ -99,89 +101,65 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
             page_content = f"<h2>Page {display_page_num}</h2>"
             
             elements = []
-            captured_rects = []
+            table_rects = []
 
-            # 2. PyMuPDF 기본 표 감지 (`find_tables`) 시도
+            # 2. PDF 내 표(Table) 전체 영역을 완벽하게 통짜로 감지하여 하나의 고화질 이미지로 캡처
             try:
                 tables = page.find_tables()
                 if tables:
                     for t in tables:
                         t_rect = t.rect
-                        captured_rects.append(t_rect)
+                        table_rects.append(t_rect)
                         
+                        # 표 전체 영역을 200 DPI 고해상도 단일 이미지로 렌더링
                         pix = page.get_pixmap(clip=t_rect, dpi=200)
                         img_counter += 1
-                        img_name = f"Images/table_{img_counter}.png"
+                        img_name = f"Images/table_full_{img_counter}.png"
                         
                         book.add_item(epub.EpubItem(
-                            uid=f"table_{img_counter}",
+                            uid=f"table_full_{img_counter}",
                             file_name=img_name,
                             media_type="image/png",
                             content=pix.tobytes("png")
                         ))
                         elements.append({
                             'y0': t_rect.y0,
-                            'html': f'<div class="img-container"><img src="{img_name}" alt="Table Graphic" /></div>'
+                            'html': f'<div class="img-container"><img src="{img_name}" alt="Professional Report Table" /></div>'
                         })
             except Exception:
                 pass
 
-            # 3. 만약 표 감지가 안 되었더라도, 텍스트 중에 수치/퍼센트(예: 2026E, %, QoQ 등)가 연속으로 밀집해 있으면 표 영역으로 간주하여 자동 캡처
+            # 3. 표 영역과 겹치지 않는 순수 본문 텍스트 블록 추출 (리플로우 유지)
             blocks = page.get_text("blocks")
             for b in blocks:
                 if b[6] == 0:  # 텍스트 블록
                     bx0, by0, bx1, by1, btext = b[0], b[1], b[2], b[3], b[4]
                     
-                    # 이미 캡처된 표 영역과 겹치면 패스
-                    already_captured = False
-                    for cr in captured_rects:
-                        if not (bx1 < cr.x0 or bx0 > cr.x1 or by1 < cr.y0 or by0 > cr.y1):
-                            already_captured = True
+                    # 표 영역 내부에 포함된 텍스트는 중복 출력 방지를 위해 제외
+                    in_table = False
+                    for trect in table_rects:
+                        if not (bx1 < trect.x0 or bx0 > trect.x1 or by1 < trect.y0 or by0 > trect.y1):
+                            in_table = True
                             break
-                    if already_captured:
+                    if in_table:
                         continue
-
-                    # 숫자나 기호, 연도(E) 등이 집중된 블록인지 검사 (표의 특징)
-                    lines = [line.strip() for line in btext.split('\n') if line.strip()]
-                    digit_line_count = sum(1 for line in lines if re.search(r'[\d%\+\-,.EHQ년월일]', line))
                     
-                    # 표처럼 데이터가 세로로 나열된 블록인 경우 텍스트로 풀지 않고 이미지(클립)로 캡처
-                    if len(lines) >= 3 and (digit_line_count / len(lines) >= 0.6):
-                        table_like_rect = fitz.Rect(bx0 - 5, by0 - 5, bx1 + 5, by1 + 5)
-                        captured_rects.append(table_like_rect)
-                        
-                        pix = page.get_pixmap(clip=table_like_rect, dpi=200)
-                        img_counter += 1
-                        img_name = f"Images/autotable_{img_counter}.png"
-                        
-                        book.add_item(epub.EpubItem(
-                            uid=f"autotable_{img_counter}",
-                            file_name=img_name,
-                            media_type="image/png",
-                            content=pix.tobytes("png")
-                        ))
+                    text_html = ""
+                    for line in btext.split('\n'):
+                        cleaned = line.strip()
+                        if cleaned and not re.match(r'^\s*\d+\s*$', cleaned):
+                            if len(cleaned) < 40 and any(k in cleaned for k in ["요약", "전망", "분석", "투자", "목표", "Key", "Charts", "반도체"]):
+                                text_html += f"<h3>{cleaned}</h3>"
+                            else:
+                                text_html += f"<p>{cleaned}</p>"
+                                
+                    if text_html.strip():
                         elements.append({
                             'y0': by0,
-                            'html': f'<div class="img-container"><img src="{img_name}" alt="Auto Detected Table" /></div>'
+                            'html': text_html
                         })
-                    else:
-                        # 일반 본문 텍스트 처리 (리플로우 유지)
-                        text_html = ""
-                        for line in lines:
-                            cleaned = line.strip()
-                            if cleaned and not re.match(r'^\s*\d+\s*$', cleaned):
-                                if len(cleaned) < 40 and any(k in cleaned for k in ["요약", "전망", "분석", "투자", "목표", "Key", "Charts"]):
-                                    text_html += f"<h3>{cleaned}</h3>"
-                                else:
-                                    text_html += f"<p>{cleaned}</p>"
-                                    
-                        if text_html.strip():
-                            elements.append({
-                                'y0': by0,
-                                'html': text_html
-                            })
 
-            # 4. 독립된 이미지/그래프 객체 추출
+            # 4. 독립된 차트 및 이미지 객체 추출
             try:
                 img_infos = page.get_image_info(xrefs=True)
                 for img_info in img_infos:
@@ -189,7 +167,7 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
                     bbox = img_info.get("bbox")
                     if not xref or not bbox:
                         continue
-                    if (bbox[2] - bbox[0] < 40) or (bbox[3] - bbox[1] < 40):
+                    if (bbox[2] - bbox[0] < 50) or (bbox[3] - bbox[1] < 50):
                         continue
                         
                     base_image = doc.extract_image(xref)
@@ -197,22 +175,22 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
                     image_ext = base_image["ext"]
                     
                     img_counter += 1
-                    img_name = f"Images/img_{img_counter}.{image_ext}"
+                    img_name = f"Images/chart_{img_counter}.{image_ext}"
                     
                     book.add_item(epub.EpubItem(
-                        uid=f"img_{img_counter}",
+                        uid=f"chart_{img_counter}",
                         file_name=img_name,
                         media_type=f"image/{image_ext}",
                         content=image_bytes
                     ))
                     elements.append({
                         'y0': bbox[1],
-                        'html': f'<div class="img-container"><img src="{img_name}" alt="Chart/Image" /></div>'
+                        'html': f'<div class="img-container"><img src="{img_name}" alt="Report Chart" /></div>'
                     })
             except Exception:
                 pass
 
-            # 5. 위에서부터 아래로 나타나는 순서대로 정렬 후 배치
+            # 5. 페이지 내 요소들을 위에서 아래로 흐르는 순서(y좌표)에 맞춰 정렬 후 배치
             elements.sort(key=lambda x: x['y0'])
             for el in elements:
                 page_content += el['html']
@@ -247,13 +225,13 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
 
 # --- Streamlit UI ---
 st.title("📊 증권사 리포트 PDF to EPUB 3 변환기")
-st.markdown("텍스트 리플로우, 표/그래프 자동 이미지 캡처, 재무제표 생략 기능이 적용된 최적화 변환기입니다.")
+st.markdown("텍스트 리플로우, 표 전체 통짜 고화질 캡처, 재무제표 생략 기능이 적용된 프로급 변환기입니다.")
 
 uploaded_file = st.file_uploader("변환할 증권사 리포트 PDF 파일을 업로드하세요", type=["pdf"])
 custom_title = st.text_input("생성될 EPUB 파일 제목", value="증권사 리포트 분석")
 
 if uploaded_file is not None and st.button("🚀 EPUB 3 변환 시작", type="primary"):
-    with st.spinner("PDF 분석 중 (텍스트 및 표 자동 이미지 캡처 변환 중)..."):
+    with st.spinner("PDF 분석 중 (텍스트 리플로우 및 표 전체 통짜 고화질 캡처 중)..."):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
             tmp_pdf.write(uploaded_file.getvalue())
             tmp_pdf_path = tmp_pdf.name
@@ -262,7 +240,7 @@ if uploaded_file is not None and st.button("🚀 EPUB 3 변환 시작", type="pr
         
         try:
             convert_pdf_to_epub_v3(tmp_pdf_path, output_epub_path, title=custom_title)
-            st.success("✨ 맞춤형 EPUB 변환 완료!")
+            st.success("✨ 프로급 EPUB 변환 완료!")
             
             with open(output_epub_path, "rb") as f:
                 st.download_button(
