@@ -85,7 +85,7 @@ def convert_pdf_to_epub_v3(pdf_path, output_epub_path, title="증권사 리포�
                     # 단순 페이지 번호 등 불필요한 단락 필터링
                     if cleaned_p and not re.match(r'^\s*\d+\s*$', cleaned_p):
                         # 제목성 텍스트 감지 시 소제목 태그 적용
-                        if len(cleaned_p) < 30 and (p.isupper() or "요약" in cleanedp or "전망" in cleanedp or "분석" in cleanedp):
+                        if len(cleaned_p) < 30 and (p.isupper() or "요약" in cleaned_p or "전망" in cleaned_p or "분석" in cleaned_p):
                             page_content += f"<h3>{cleaned_p}</h3>"
                         else:
                             page_content += f"<p>{cleaned_p}</p>"
