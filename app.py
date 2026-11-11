@@ -3,7 +3,7 @@ import os
 import re
 import html
 import tempfile
-from pathlib import Path
+import uuid
 
 import fitz
 import streamlit as st
@@ -11,20 +11,25 @@ from ebooklib import epub
 
 
 # ============================================================
-# 기본 설정
+# 1. Streamlit
 # ============================================================
 
 st.set_page_config(
-    page_title="증권사 PDF → EPUB 3 변환기",
+    page_title="증권사 PDF EPUB 3 변환기",
     page_icon="📚",
     layout="centered"
 )
 
 st.title("📚 증권사 리포트 PDF → EPUB 3")
 st.caption(
-    "본문은 확대 가능한 텍스트로 변환하고 "
-    "표·그래프·사진은 PDF 원본에서 고해상도로 캡처합니다."
+    "본문은 리플로우 텍스트, 표는 실제 EPUB 표 또는 고해상도 이미지, "
+    "그래프와 사진은 원본 캡처로 변환합니다."
 )
+
+
+# ============================================================
+# 2. 재무제표 판별
+# ============================================================
 
 FINANCIAL_HEADINGS = [
     "재무상태표",
@@ -38,35 +43,7 @@ FINANCIAL_HEADINGS = [
 ]
 
 
-# ============================================================
-# 텍스트 및 영역 처리
-# ============================================================
-
-def clean_text(text):
-    text = text.replace("\x00", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def rect_area(rect):
-    return max(0, rect.width) * max(0, rect.height)
-
-
-def overlap_ratio(a, b):
-    area = rect_area(a)
-    if area <= 0:
-        return 0
-
-    inter = a & b
-    return rect_area(inter) / area
-
-
 def is_financial_statement(text):
-    """
-    일반 실적 분석 페이지는 제외하지 않고
-    재무제표 제목이나 계정과목이 명확한 경우만 제외.
-    """
     compact = re.sub(r"\s+", "", text)
 
     if any(word in compact for word in FINANCIAL_HEADINGS):
@@ -87,88 +64,304 @@ def is_financial_statement(text):
     return hits >= 4
 
 
-def valid_rect(rect, page_rect, min_area=0.003):
-    if rect.width < 65 or rect.height < 30:
-        return False
+# ============================================================
+# 3. 공통 영역 함수
+# ============================================================
 
-    if rect_area(rect) / max(1, rect_area(page_rect)) < min_area:
-        return False
+def area(rect):
+    return max(0, rect.width) * max(0, rect.height)
 
-    return True
+
+def overlap_ratio(a, b):
+    total = area(a)
+
+    if total <= 0:
+        return 0
+
+    return area(a & b) / total
+
+
+def clean_text(text):
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def escape_text(text):
+    return html.escape(str(text or ""))
 
 
 def expand_rect(rect, page_rect, margin=4):
-    """
-    캡처 시 표 테두리와 그래프 가장자리가 잘리지 않도록
-    주변 여백을 조금 추가.
-    """
-    expanded = fitz.Rect(
+    result = fitz.Rect(
         rect.x0 - margin,
         rect.y0 - margin,
         rect.x1 + margin,
         rect.y1 + margin
     )
 
-    return expanded & page_rect
+    return result & page_rect
+
+
+def is_valid_visual(rect, page_rect):
+    if rect.width < 65 or rect.height < 35:
+        return False
+
+    ratio = area(rect) / max(1, area(page_rect))
+
+    if ratio < 0.004:
+        return False
+
+    if rect.height > page_rect.height * 0.92:
+        return False
+
+    return True
 
 
 # ============================================================
-# 표 검출
+# 4. 표 데이터 품질 평가
+# ============================================================
+
+def normalize_table_data(rows):
+    result = []
+
+    if not rows:
+        return result
+
+    max_cols = max(
+        (len(row) for row in rows if row),
+        default=0
+    )
+
+    if max_cols == 0:
+        return result
+
+    for row in rows:
+        row = list(row or [])
+
+        row += [None] * (max_cols - len(row))
+
+        result.append([
+            clean_text(str(cell)) if cell is not None else ""
+            for cell in row
+        ])
+
+    # 완전히 비어 있는 행 제거
+    result = [
+        row for row in result
+        if any(cell.strip() for cell in row)
+    ]
+
+    return result
+
+
+def evaluate_table(rows):
+    """
+    실제 EPUB 표로 재구성할 수 있는지 평가.
+    셀 데이터가 지나치게 비어 있거나 구조가 불규칙하면
+    원본 캡처 방식으로 전환.
+    """
+
+    if len(rows) < 2:
+        return False
+
+    cols = max(len(row) for row in rows)
+
+    if cols < 2:
+        return False
+
+    if cols > 25 or len(rows) > 150:
+        return False
+
+    total_cells = len(rows) * cols
+
+    filled_cells = sum(
+        1 for row in rows
+        for cell in row
+        if cell.strip()
+    )
+
+    density = filled_cells / max(1, total_cells)
+
+    if density < 0.25:
+        return False
+
+    # 표 데이터가 실제로 존재하는지 검사
+    numeric_cells = sum(
+        1 for row in rows
+        for cell in row
+        if re.search(r"\d", cell)
+    )
+
+    if numeric_cells < 2:
+        return False
+
+    # 행별 열 수가 지나치게 불규칙하면 이미지 처리
+    row_lengths = [len(row) for row in rows]
+
+    if len(set(row_lengths)) > 1:
+        return False
+
+    return True
+
+
+# ============================================================
+# 5. EPUB 표 HTML 생성
+# ============================================================
+
+def table_to_html(rows, table_number):
+    """
+    실제 HTML table로 재구성.
+    첫 번째 행을 헤더로 표시.
+    """
+
+    output = [
+        '<div class="table-scroll">',
+        f'<table class="report-table" id="table-{table_number}">',
+        '<thead><tr>'
+    ]
+
+    first_row = rows[0]
+
+    for cell in first_row:
+        output.append(
+            f'<th>{escape_text(cell)}</th>'
+        )
+
+    output.append('</tr></thead><tbody>')
+
+    for row in rows[1:]:
+
+        output.append('<tr>')
+
+        for cell in row:
+            output.append(
+                f'<td>{escape_text(cell)}</td>'
+            )
+
+        output.append('</tr>')
+
+    output.append('</tbody></table></div>')
+
+    return "".join(output)
+
+
+# ============================================================
+# 6. 표 검출
 # ============================================================
 
 def detect_tables(page):
     """
-    표 전체의 bounding box를 검출.
-    행별 셀을 개별 캡처하지 않음.
+    표 전체를 검출합니다.
+    숫자 밀집 텍스트 블록을 표로 추측하는 기능은 사용하지 않습니다.
     """
-    results = []
 
-    strategies = ["lines", "text"]
-
-    for strategy in strategies:
-        try:
-            finder = page.find_tables(strategy=strategy)
-
-            for table in finder.tables:
-                rect = fitz.Rect(table.bbox)
-
-                if rect.width >= 80 and rect.height >= 35:
-                    results.append({
-                        "rect": rect,
-                        "kind": "table",
-                        "score": 100
-                    })
-
-        except Exception:
-            continue
-
-    return results
-
-
-# ============================================================
-# 이미지 및 그래프 검출
-# ============================================================
-
-def detect_images(page):
     results = []
 
     try:
-        image_infos = page.get_image_info(xrefs=True)
+        finder = page.find_tables(strategy="lines")
 
-        for info in image_infos:
-            bbox = info.get("bbox")
+        for table in finder.tables:
 
-            if not bbox:
+            rect = fitz.Rect(table.bbox)
+
+            if rect.width < 70 or rect.height < 30:
                 continue
 
-            rect = fitz.Rect(bbox)
+            try:
+                rows = normalize_table_data(table.extract())
+            except Exception:
+                rows = []
 
-            if rect.width >= 55 and rect.height >= 40:
-                results.append({
-                    "rect": rect,
-                    "kind": "image",
-                    "score": 80
-                })
+            # 외부 헤더가 별도로 검출되는 경우 헤더 보완
+            try:
+                header = table.header
+
+                if (
+                    getattr(header, "external", False)
+                    and getattr(header, "names", None)
+                ):
+                    names = [
+                        clean_text(str(x or ""))
+                        for x in header.names
+                    ]
+
+                    if names and (
+                        not rows or rows[0] != names
+                    ):
+                        rows.insert(0, names)
+
+            except Exception:
+                pass
+
+            results.append({
+                "rect": rect,
+                "rows": rows,
+                "mode": (
+                    "table"
+                    if evaluate_table(rows)
+                    else "image"
+                ),
+                "kind": "table"
+            })
+
+    except Exception:
+        pass
+
+    # 선이 없는 표 보조 검출
+    try:
+        finder = page.find_tables(strategy="text")
+
+        for table in finder.tables:
+
+            rect = fitz.Rect(table.bbox)
+
+            if rect.width < 90 or rect.height < 35:
+                continue
+
+            # 이미 검출된 표와 대부분 겹치면 중복 제외
+            if any(
+                overlap_ratio(rect, old["rect"]) > 0.75
+                or overlap_ratio(old["rect"], rect) > 0.75
+                for old in results
+            ):
+                continue
+
+            try:
+                rows = normalize_table_data(table.extract())
+            except Exception:
+                rows = []
+
+            try:
+                header = table.header
+
+                if (
+                    getattr(header, "external", False)
+                    and getattr(header, "names", None)
+                ):
+                    names = [
+                        clean_text(str(x or ""))
+                        for x in header.names
+                    ]
+
+                    if names and (
+                        not rows or rows[0] != names
+                    ):
+                        rows.insert(0, names)
+
+            except Exception:
+                pass
+
+            results.append({
+                "rect": rect,
+                "rows": rows,
+                "mode": (
+                    "table"
+                    if evaluate_table(rows)
+                    else "image"
+                ),
+                "kind": "table"
+            })
 
     except Exception:
         pass
@@ -176,11 +369,53 @@ def detect_images(page):
     return results
 
 
-def detect_vector_graphs(page):
+# ============================================================
+# 7. 사진 및 그래프 영역 검출
+# ============================================================
+
+def detect_images(page, table_regions):
+    results = []
+
+    try:
+        infos = page.get_image_info(xrefs=True)
+
+        for info in infos:
+
+            bbox = info.get("bbox")
+
+            if not bbox:
+                continue
+
+            rect = fitz.Rect(bbox)
+
+            if not is_valid_visual(rect, page.rect):
+                continue
+
+            # 표 안의 이미지 조각은 별도 삽입하지 않음
+            if any(
+                overlap_ratio(rect, t["rect"]) > 0.55
+                for t in table_regions
+            ):
+                continue
+
+            results.append({
+                "rect": rect,
+                "kind": "image",
+                "mode": "image"
+            })
+
+    except Exception:
+        pass
+
+    return results
+
+
+def detect_vector_graphs(page, table_regions, image_regions):
     """
-    PDF 안의 선, 도형, 벡터 그래프 영역 검출.
-    작은 장식선이 캡처되지 않도록 크기 제한을 둠.
+    벡터 그래프 및 도형 검출.
+    작은 선 조각은 제외.
     """
+
     results = []
 
     if not hasattr(page, "cluster_drawings"):
@@ -193,26 +428,36 @@ def detect_vector_graphs(page):
         )
 
         for cluster in clusters:
+
             rect = fitz.Rect(cluster)
 
-            if not valid_rect(
-                rect,
-                page.rect,
-                min_area=0.012
-            ):
+            if not is_valid_visual(rect, page.rect):
                 continue
 
-            # 지나치게 긴 선이나 페이지 배경 장식 제거
             if rect.width > page.rect.width * 0.98:
                 continue
 
             if rect.height > page.rect.height * 0.85:
                 continue
 
+            # 표 내부 도형은 표 캡처에 포함
+            if any(
+                overlap_ratio(rect, t["rect"]) > 0.45
+                for t in table_regions
+            ):
+                continue
+
+            # 이미 이미지로 검출된 영역은 제외
+            if any(
+                overlap_ratio(rect, im["rect"]) > 0.75
+                for im in image_regions
+            ):
+                continue
+
             results.append({
                 "rect": rect,
                 "kind": "graph",
-                "score": 60
+                "mode": "image"
             })
 
     except Exception:
@@ -222,51 +467,33 @@ def detect_vector_graphs(page):
 
 
 # ============================================================
-# 후보 영역 중복 제거
+# 8. 시각자료 중복 제거
 # ============================================================
 
-def deduplicate_regions(regions):
-    """
-    같은 위치를 표와 이미지가 중복 검출한 경우
-    하나만 남김.
+def deduplicate_visuals(regions):
+    selected = []
 
-    서로 다른 표나 그래프는 무조건 합치지 않음.
-    """
+    # 큰 영역 우선
     regions = sorted(
         regions,
-        key=lambda x: (
-            x["score"],
-            rect_area(x["rect"])
-        ),
+        key=lambda x: area(x["rect"]),
         reverse=True
     )
 
-    selected = []
-
     for item in regions:
+
         rect = item["rect"]
 
         duplicate = False
 
         for old in selected:
+
             old_rect = old["rect"]
 
-            ratio1 = overlap_ratio(rect, old_rect)
-            ratio2 = overlap_ratio(old_rect, rect)
+            r1 = overlap_ratio(rect, old_rect)
+            r2 = overlap_ratio(old_rect, rect)
 
-            intersection = rect & old_rect
-
-            # 한 영역이 다른 영역에 대부분 포함되면 중복
-            if ratio1 > 0.78 or ratio2 > 0.78:
-                duplicate = True
-                break
-
-            # 거의 같은 크기의 영역이 상당 부분 겹치면 중복
-            if (
-                rect_area(intersection) > 0
-                and rect_area(intersection) /
-                max(1, min(rect_area(rect), rect_area(old_rect))) > 0.85
-            ):
+            if r1 > 0.82 or r2 > 0.82:
                 duplicate = True
                 break
 
@@ -277,15 +504,16 @@ def deduplicate_regions(regions):
 
 
 # ============================================================
-# 표·그래프·이미지 고해상도 캡처
+# 9. 원본 PDF 고해상도 캡처
 # ============================================================
 
-def capture_region(page, rect, dpi):
-    """
-    PDF 원본을 직접 렌더링.
-    이미지 추출보다 벡터 그래프 및 표 보존에 유리.
-    """
-    rect = expand_rect(rect, page.rect, margin=5)
+def capture_pdf_region(page, rect, dpi):
+
+    rect = expand_rect(
+        rect,
+        page.rect,
+        margin=5
+    )
 
     pix = page.get_pixmap(
         matrix=fitz.Matrix(dpi / 72, dpi / 72),
@@ -299,24 +527,34 @@ def capture_region(page, rect, dpi):
 
 
 # ============================================================
-# 텍스트 추출 및 제목 구분
+# 10. 텍스트 추출
 # ============================================================
 
-def extract_text_blocks(page):
+def extract_blocks(page):
     data = page.get_text("dict", sort=True)
-    results = []
+
+    blocks = []
 
     for block in data.get("blocks", []):
+
         if block.get("type") != 0:
             continue
 
         lines = []
+        font_sizes = []
 
         for line in block.get("lines", []):
+
             line_text = ""
 
             for span in line.get("spans", []):
+
                 line_text += span.get("text", "")
+
+                if span.get("text", "").strip():
+                    font_sizes.append(
+                        span.get("size", 0)
+                    )
 
             line_text = clean_text(line_text)
 
@@ -328,67 +566,70 @@ def extract_text_blocks(page):
         if not text:
             continue
 
-        rect = fitz.Rect(block["bbox"])
-
-        max_size = 0
-
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                max_size = max(
-                    max_size,
-                    span.get("size", 0)
-                )
-
-        results.append({
-            "rect": rect,
+        blocks.append({
+            "rect": fitz.Rect(block["bbox"]),
             "text": text,
-            "font_size": max_size
+            "font_size": (
+                max(font_sizes)
+                if font_sizes else 10
+            )
         })
 
-    return results
+    return blocks
 
 
-def text_to_html(text, font_size):
+def text_block_overlaps_visual(rect, regions):
     """
-    HTML 특수문자 처리.
-    큰 글씨는 소제목으로 변환.
+    표·그래프·사진 내부 텍스트를 완전히 차단.
+    기존의 부분 겹침 방식보다 강하게 제외.
     """
-    safe = html.escape(text)
 
-    lines = [
-        line.strip()
-        for line in safe.split("\n")
-        if line.strip()
-    ]
-
-    output = []
-
-    for line in lines:
-        if re.fullmatch(r"\d+", line):
-            continue
-
-        if len(line) < 65 and font_size >= 13:
-            output.append(f"<h3>{line}</h3>")
-        else:
-            output.append(f"<p>{line}</p>")
-
-    return "\n".join(output)
-
-
-def block_is_inside_region(block_rect, regions):
-    """
-    캡처된 표·그래프 내부의 텍스트는
-    중복 출력하지 않음.
-    """
     for region in regions:
-        if overlap_ratio(block_rect, region["rect"]) >= 0.45:
+
+        visual_rect = region["rect"]
+
+        # 텍스트 블록의 절반 이상이 시각자료 안에 있으면 제외
+        if overlap_ratio(rect, visual_rect) >= 0.45:
+            return True
+
+        # 텍스트 블록 중심이 시각자료 내부에 있는 경우
+        center = fitz.Point(
+            (rect.x0 + rect.x1) / 2,
+            (rect.y0 + rect.y1) / 2
+        )
+
+        if visual_rect.contains(center):
             return True
 
     return False
 
 
+def text_to_html(text, font_size):
+
+    output = []
+
+    for line in text.split("\n"):
+
+        line = line.strip()
+
+        if not line:
+            continue
+
+        if re.fullmatch(r"\d+", line):
+            continue
+
+        safe = escape_text(line)
+
+        if len(line) < 65 and font_size >= 13:
+            output.append(f"<h3>{safe}</h3>")
+        else:
+            output.append(f"<p>{safe}</p>")
+
+    return "\n".join(output)
+
+
 # ============================================================
-# EPUB CSS
+# 11. EPUB CSS
 # ============================================================
 
 EPUB_CSS = """
@@ -399,34 +640,74 @@ body {
     sans-serif;
     line-height: 1.75;
     padding: 4%;
-    color: #222222;
+    color: #222;
     word-break: keep-all;
 }
 
 h2 {
     font-size: 1.35em;
-    line-height: 1.5;
-    margin-top: 1.5em;
+    margin-top: 1.4em;
     margin-bottom: 1em;
-    border-bottom: 1px solid #cccccc;
+    border-bottom: 1px solid #ccc;
     padding-bottom: 0.4em;
 }
 
 h3 {
     font-size: 1.12em;
-    line-height: 1.5;
-    margin-top: 1.4em;
-    margin-bottom: 0.7em;
-    font-weight: bold;
+    margin-top: 1.3em;
+    margin-bottom: 0.6em;
 }
 
 p {
     font-size: 1em;
     line-height: 1.8;
-    margin: 0.4em 0 0.9em 0;
+    margin: 0.4em 0 0.9em;
     text-align: justify;
 }
 
+/* 실제 표: 모바일 가로 스크롤 */
+.table-scroll {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    margin: 1.2em 0;
+    page-break-inside: avoid;
+}
+
+.report-table {
+    border-collapse: collapse;
+    width: max-content;
+    min-width: 100%;
+    font-size: 0.85em;
+    line-height: 1.5;
+    word-break: keep-all;
+}
+
+.report-table th,
+.report-table td {
+    border: 1px solid #c9cdd2;
+    padding: 0.45em 0.55em;
+    text-align: right;
+    vertical-align: middle;
+    white-space: nowrap;
+}
+
+.report-table th {
+    background: #edf1f5;
+    font-weight: bold;
+    text-align: center;
+}
+
+.report-table td:first-child {
+    text-align: left;
+}
+
+.report-table tr:nth-child(even) {
+    background: #f8f9fa;
+}
+
+/* 고해상도 캡처 이미지 */
 .visual {
     margin: 1.2em 0;
     text-align: center;
@@ -441,37 +722,24 @@ p {
     margin: 0 auto;
 }
 
-.visual-caption {
-    font-size: 0.8em;
-    color: #666666;
-    margin-top: 0.3em;
-    text-align: center;
-}
-
 .page-number {
-    color: #888888;
+    color: #888;
     font-size: 0.8em;
     text-align: right;
     margin-bottom: 1em;
-}
-
-.skip-notice {
-    color: #777777;
-    font-style: italic;
-    text-align: center;
 }
 """
 
 
 # ============================================================
-# PDF → EPUB 변환
+# 12. PDF → EPUB 변환
 # ============================================================
 
 def convert_pdf_to_epub(
     pdf_path,
     output_path,
     title,
-    dpi=360,
+    dpi=400,
     skip_financial=True
 ):
 
@@ -479,10 +747,7 @@ def convert_pdf_to_epub(
 
     book = epub.EpubBook()
 
-    book.set_identifier(
-        f"report-{os.path.basename(pdf_path)}"
-    )
-
+    book.set_identifier(str(uuid.uuid4()))
     book.set_title(title)
     book.set_language("ko")
     book.add_author("Report EPUB Converter")
@@ -498,6 +763,8 @@ def convert_pdf_to_epub(
 
     chapters = []
     image_count = 0
+    table_count = 0
+    image_table_count = 0
     skipped_pages = []
     warnings = []
 
@@ -508,10 +775,7 @@ def convert_pdf_to_epub(
 
         page_text = page.get_text("text")
 
-        # ----------------------------------------------------
-        # 재무제표 페이지 생략
-        # ----------------------------------------------------
-
+        # 재무제표 생략
         if skip_financial and is_financial_statement(page_text):
             skipped_pages.append(page_number)
             continue
@@ -519,45 +783,145 @@ def convert_pdf_to_epub(
         elements = []
 
         # ----------------------------------------------------
-        # 시각자료 영역 검출
+        # A. 표 검출
         # ----------------------------------------------------
 
-        regions = []
+        table_regions = detect_tables(page)
 
-        regions.extend(detect_tables(page))
-        regions.extend(detect_images(page))
-        regions.extend(detect_vector_graphs(page))
+        # ----------------------------------------------------
+        # B. 이미지 검출
+        # ----------------------------------------------------
 
-        regions = deduplicate_regions(regions)
-
-        # 지나치게 작은 영역 제거
-        regions = [
-            item for item in regions
-            if valid_rect(
-                item["rect"],
-                page.rect,
-                min_area=0.003
-            )
-        ]
-
-        # 위에서 아래 순서로 정렬
-        regions.sort(
-            key=lambda x: (
-                x["rect"].y0,
-                x["rect"].x0
-            )
+        image_regions = detect_images(
+            page,
+            table_regions
         )
 
         # ----------------------------------------------------
-        # 시각자료 원본 영역 캡처
+        # C. 벡터 그래프 검출
         # ----------------------------------------------------
 
-        for region in regions:
+        graph_regions = detect_vector_graphs(
+            page,
+            table_regions,
+            image_regions
+        )
+
+        # ----------------------------------------------------
+        # D. 표·그래프·이미지 영역 구성
+        # ----------------------------------------------------
+
+        visual_regions = []
+
+        for item in table_regions:
+            visual_regions.append(item)
+
+        for item in image_regions:
+            visual_regions.append(item)
+
+        for item in graph_regions:
+            visual_regions.append(item)
+
+        visual_regions = deduplicate_visuals(
+            visual_regions
+        )
+
+        # ----------------------------------------------------
+        # E. 표 처리
+        # ----------------------------------------------------
+
+        for region in table_regions:
+
+            # 중복 제거 과정에서 제외된 표는 처리하지 않음
+            if not any(
+                region is x or (
+                    region["rect"] == x["rect"]
+                    and x["kind"] == "table"
+                )
+                for x in visual_regions
+            ):
+                continue
+
+            rect = region["rect"]
+
+            if region["mode"] == "table":
+
+                table_count += 1
+
+                table_html = table_to_html(
+                    region["rows"],
+                    table_count
+                )
+
+                elements.append({
+                    "y": rect.y0,
+                    "x": rect.x0,
+                    "html": table_html
+                })
+
+            else:
+
+                # 구조가 복잡하면 표 전체를 이미지로 캡처
+                try:
+
+                    image_bytes = capture_pdf_region(
+                        page,
+                        rect,
+                        dpi
+                    )
+
+                    image_count += 1
+                    image_table_count += 1
+
+                    image_name = (
+                        f"Images/table_{page_number}_"
+                        f"{image_count}.png"
+                    )
+
+                    book.add_item(
+                        epub.EpubItem(
+                            uid=f"table_image_{image_count}",
+                            file_name=image_name,
+                            media_type="image/png",
+                            content=image_bytes
+                        )
+                    )
+
+                    relative_path = (
+                        f"../Images/table_{page_number}_"
+                        f"{image_count}.png"
+                    )
+
+                    elements.append({
+                        "y": rect.y0,
+                        "x": rect.x0,
+                        "html": (
+                            '<div class="visual">'
+                            f'<img src="{relative_path}" '
+                            'alt="원본 표"/>'
+                            '</div>'
+                        )
+                    })
+
+                except Exception as error:
+                    warnings.append(
+                        f"{page_number}페이지 표 캡처 실패: {error}"
+                    )
+
+        # ----------------------------------------------------
+        # F. 사진 및 그래프 캡처
+        # ----------------------------------------------------
+
+        for region in visual_regions:
+
+            if region["kind"] == "table":
+                continue
 
             rect = region["rect"]
 
             try:
-                image_bytes = capture_region(
+
+                image_bytes = capture_pdf_region(
                     page,
                     rect,
                     dpi
@@ -566,56 +930,55 @@ def convert_pdf_to_epub(
                 image_count += 1
 
                 image_name = (
-                    f"Images/page_{page_number}_"
-                    f"visual_{image_count}.png"
+                    f"Images/visual_{page_number}_"
+                    f"{image_count}.png"
                 )
 
-                image_item = epub.EpubItem(
-                    uid=f"visual_{image_count}",
-                    file_name=image_name,
-                    media_type="image/png",
-                    content=image_bytes
+                book.add_item(
+                    epub.EpubItem(
+                        uid=f"visual_{image_count}",
+                        file_name=image_name,
+                        media_type="image/png",
+                        content=image_bytes
+                    )
                 )
 
-                book.add_item(image_item)
-
-                # XHTML은 Text 폴더 안에 있으므로
-                # 이미지 경로는 반드시 ../Images/
                 relative_path = (
-                    f"../Images/page_{page_number}_"
-                    f"visual_{image_count}.png"
+                    f"../Images/visual_{page_number}_"
+                    f"{image_count}.png"
                 )
-
-                visual_html = f"""
-                <div class="visual">
-                    <img src="{relative_path}"
-                         alt="PDF 원본 시각자료"/>
-                </div>
-                """
 
                 elements.append({
                     "y": rect.y0,
                     "x": rect.x0,
-                    "html": visual_html
+                    "html": (
+                        '<div class="visual">'
+                        f'<img src="{relative_path}" '
+                        'alt="원본 그래프 또는 이미지"/>'
+                        '</div>'
+                    )
                 })
 
             except Exception as error:
                 warnings.append(
-                    f"{page_number}페이지 시각자료 캡처 실패: {error}"
+                    f"{page_number}페이지 이미지 캡처 실패: {error}"
                 )
 
         # ----------------------------------------------------
-        # 본문 텍스트 추출
+        # G. 본문 추출
         # ----------------------------------------------------
 
-        text_blocks = extract_text_blocks(page)
+        text_blocks = extract_blocks(page)
 
         for block in text_blocks:
 
             rect = block["rect"]
 
-            # 표·그래프 내부 텍스트 중복 제거
-            if block_is_inside_region(rect, regions):
+            # 표, 그래프, 사진 내부 텍스트 차단
+            if text_block_overlaps_visual(
+                rect,
+                visual_regions
+            ):
                 continue
 
             text_html = text_to_html(
@@ -632,7 +995,7 @@ def convert_pdf_to_epub(
                 })
 
         # ----------------------------------------------------
-        # 텍스트와 이미지 원래 위치 순서로 배치
+        # H. 원본 페이지 순서대로 배치
         # ----------------------------------------------------
 
         elements.sort(
@@ -648,18 +1011,11 @@ def convert_pdf_to_epub(
             f'</div>'
         )
 
-        for element in elements:
-            page_content += element["html"]
-
-        if not elements:
-            page_content += (
-                '<p class="skip-notice">'
-                '이 페이지에서 추출할 수 있는 콘텐츠가 없습니다.'
-                '</p>'
-            )
+        for item in elements:
+            page_content += item["html"]
 
         # ----------------------------------------------------
-        # EPUB 페이지 생성
+        # I. EPUB 챕터 생성
         # ----------------------------------------------------
 
         chapter = epub.EpubHtml(
@@ -671,11 +1027,10 @@ def convert_pdf_to_epub(
         chapter.content = f"""
         <?xml version="1.0" encoding="utf-8"?>
         <html xmlns="http://www.w3.org/1999/xhtml"
-              xmlns:epub="http://www.idpf.org/2007/ops"
               lang="ko">
         <head>
             <meta charset="utf-8"/>
-            <title>{html.escape(title)} - {page_number}페이지</title>
+            <title>{escape_text(title)} - {page_number}페이지</title>
             <link rel="stylesheet"
                   type="text/css"
                   href="../Styles/main.css"/>
@@ -688,11 +1043,12 @@ def convert_pdf_to_epub(
         """
 
         chapter.add_item(css_item)
+
         book.add_item(chapter)
         chapters.append(chapter)
 
     # --------------------------------------------------------
-    # 목차 및 EPUB 구조
+    # EPUB 목차
     # --------------------------------------------------------
 
     book.toc = tuple(chapters)
@@ -707,15 +1063,18 @@ def convert_pdf_to_epub(
     doc.close()
 
     return {
-        "pages": len(chapters),
+        "total_pages": len(chapters) + len(skipped_pages),
+        "converted_pages": len(chapters),
+        "actual_tables": table_count,
+        "image_tables": image_table_count,
         "images": image_count,
-        "skipped": skipped_pages,
+        "skipped_pages": skipped_pages,
         "warnings": warnings
     }
 
 
 # ============================================================
-# Streamlit 화면
+# 13. 사용자 화면
 # ============================================================
 
 uploaded_file = st.file_uploader(
@@ -728,10 +1087,10 @@ custom_title = st.text_input(
     value="증권사 리포트"
 )
 
-dpi_choice = st.select_slider(
+dpi = st.select_slider(
     "표·그래프 캡처 해상도",
     options=[250, 300, 360, 400],
-    value=360
+    value=400
 )
 
 skip_financial = st.checkbox(
@@ -740,8 +1099,9 @@ skip_financial = st.checkbox(
 )
 
 st.info(
-    "360 DPI를 기본으로 권장합니다. "
-    "400 DPI는 이미지 용량이 더 커질 수 있습니다."
+    "권장 설정: 400 DPI. "
+    "실제 EPUB 표는 텍스트로 재구성하며, "
+    "복잡한 표는 원본 이미지로 보존합니다."
 )
 
 if uploaded_file is not None:
@@ -760,64 +1120,84 @@ if uploaded_file is not None:
             with tempfile.NamedTemporaryFile(
                 delete=False,
                 suffix=".pdf"
-            ) as pdf_file:
+            ) as f:
 
-                pdf_file.write(
-                    uploaded_file.getvalue()
-                )
+                f.write(uploaded_file.getvalue())
+                temp_pdf = f.name
 
-                temp_pdf = pdf_file.name
-
-            temp_epub = (
-                tempfile.mktemp(suffix=".epub")
+            temp_epub = tempfile.mktemp(
+                suffix=".epub"
             )
 
             with st.spinner(
-                "PDF의 본문·표·그래프를 분석하고 있습니다..."
+                "표 구조 분석 및 고해상도 변환 중..."
             ):
 
                 result = convert_pdf_to_epub(
                     temp_pdf,
                     temp_epub,
                     custom_title,
-                    dpi=dpi_choice,
+                    dpi=dpi,
                     skip_financial=skip_financial
                 )
 
-            st.success("EPUB 3 변환이 완료되었습니다.")
+            st.success("EPUB 3 변환 완료")
 
-            st.write(
-                f"변환된 페이지: {result['pages']}페이지"
+            st.subheader("변환 결과")
+
+            col1, col2 = st.columns(2)
+
+            col1.metric(
+                "변환 페이지",
+                result["converted_pages"]
             )
 
-            st.write(
-                f"캡처된 표·그래프·이미지: "
-                f"{result['images']}개"
+            col2.metric(
+                "실제 EPUB 표",
+                result["actual_tables"]
             )
 
-            if result["skipped"]:
+            col3, col4 = st.columns(2)
+
+            col3.metric(
+                "이미지 표",
+                result["image_tables"]
+            )
+
+            col4.metric(
+                "그래프·사진 등 이미지",
+                result["images"]
+            )
+
+            if result["skipped_pages"]:
                 st.warning(
-                    "재무제표로 판단해 생략한 페이지: "
-                    + ", ".join(map(str, result["skipped"]))
+                    "생략된 재무제표 페이지: "
+                    + ", ".join(
+                        map(str, result["skipped_pages"])
+                    )
                 )
 
             if result["warnings"]:
-                with st.expander("변환 경고 확인"):
+
+                with st.expander("변환 경고"):
                     for warning in result["warnings"]:
                         st.write(warning)
 
-            with open(temp_epub, "rb") as epub_file:
+            with open(temp_epub, "rb") as f:
 
                 st.download_button(
-                    label="📥 EPUB 파일 다운로드",
-                    data=epub_file.read(),
+                    "📥 EPUB 다운로드",
+                    data=f.read(),
                     file_name=f"{custom_title}.epub",
                     mime="application/epub+zip",
                     use_container_width=True
                 )
 
         except Exception as error:
-            st.error(f"변환 오류: {error}")
+
+            st.error(
+                f"변환 중 오류가 발생했습니다: {error}"
+            )
 
         finally:
 
