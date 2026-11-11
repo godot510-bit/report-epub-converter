@@ -10,6 +10,10 @@ import streamlit as st
 from ebooklib import epub
 
 
+# ============================================================
+# 1. 화면 설정
+# ============================================================
+
 st.set_page_config(
     page_title="증권사 리포트 PDF to EPUB 3",
     page_icon="📚",
@@ -17,11 +21,11 @@ st.set_page_config(
 )
 
 st.title("📚 증권사 리포트 PDF → EPUB 3")
-st.caption("본문 리플로우 · 실제 표 재구성 · 고해상도 그래프 및 이미지")
+st.caption("본문 리플로우 · 실제 표 재구성 · 그래프 및 이미지 고화질 보존")
 
 
 # ============================================================
-# 1. 재무제표 페이지 판별
+# 2. 재무제표 페이지 판별
 # ============================================================
 
 FINANCIAL_HEADINGS = [
@@ -37,6 +41,7 @@ FINANCIAL_HEADINGS = [
 
 
 def is_financial_statement(text):
+
     compact = re.sub(r"\s+", "", text)
 
     if any(x in compact for x in FINANCIAL_HEADINGS):
@@ -56,7 +61,7 @@ def is_financial_statement(text):
 
 
 # ============================================================
-# 2. 공통 함수
+# 3. 공통 함수
 # ============================================================
 
 def rect_area(rect):
@@ -64,14 +69,19 @@ def rect_area(rect):
 
 
 def overlap_ratio(a, b):
+
     total = rect_area(a)
+
     if total <= 0:
         return 0
+
     return rect_area(a & b) / total
 
 
 def clean_text(text):
+
     text = str(text or "").replace("\x00", " ")
+
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -79,21 +89,27 @@ def safe_html(text):
     return html.escape(str(text or ""))
 
 
-def expand_rect(rect, page_rect, margin=4):
+def expand_rect(rect, page_rect, margin=1):
+
     expanded = fitz.Rect(
         rect.x0 - margin,
         rect.y0 - margin,
         rect.x1 + margin,
         rect.y1 + margin
     )
+
     return expanded & page_rect
 
 
 def valid_visual_rect(rect, page_rect):
+
     if rect.width < 55 or rect.height < 25:
         return False
 
-    ratio = rect_area(rect) / max(1, rect_area(page_rect))
+    ratio = rect_area(rect) / max(
+        1,
+        rect_area(page_rect)
+    )
 
     return (
         ratio >= 0.002
@@ -103,10 +119,11 @@ def valid_visual_rect(rect, page_rect):
 
 
 # ============================================================
-# 3. 표 데이터 정리
+# 4. 표 데이터 정리
 # ============================================================
 
 def normalize_table_data(rows):
+
     if not rows:
         return []
 
@@ -121,8 +138,12 @@ def normalize_table_data(rows):
     result = []
 
     for row in rows:
+
         row = list(row or [])
-        row += [None] * (max_cols - len(row))
+
+        row += [None] * (
+            max_cols - len(row)
+        )
 
         result.append([
             clean_text(cell)
@@ -136,18 +157,23 @@ def normalize_table_data(rows):
 
 
 def evaluate_table(rows):
+
     if len(rows) < 2:
         return False
 
     cols = max(len(row) for row in rows)
 
-    if cols < 2 or cols > 25 or len(rows) > 150:
+    if cols < 2 or cols > 25:
+        return False
+
+    if len(rows) > 150:
         return False
 
     total = len(rows) * cols
 
     filled = sum(
-        1 for row in rows
+        1
+        for row in rows
         for cell in row
         if cell.strip()
     )
@@ -156,7 +182,8 @@ def evaluate_table(rows):
         return False
 
     numeric = sum(
-        1 for row in rows
+        1
+        for row in rows
         for cell in row
         if re.search(r"\d", cell)
     )
@@ -171,8 +198,8 @@ def evaluate_table(rows):
 
 
 # ============================================================
-# 4. 실제 표 HTML 생성
-#    ★ 셀마다 실선 테두리를 직접 지정
+# 5. 실제 HTML 표 생성
+#    가로·세로 실선 테두리 적용
 # ============================================================
 
 def table_to_html(rows, number):
@@ -215,11 +242,8 @@ def table_to_html(rows, number):
 
     output = []
 
-    output.append(
-        '<div class="table-scroll">'
-    )
+    output.append('<div class="table-scroll">')
 
-    # border 속성도 함께 지정해 EPUB 리더 호환성 강화
     output.append(
         f'<table id="table-{number}" '
         f'class="report-table" '
@@ -227,10 +251,10 @@ def table_to_html(rows, number):
         f'style="{table_style}">'
     )
 
-    # 헤더
     output.append("<thead><tr>")
 
     for cell in rows[0]:
+
         output.append(
             f'<th border="1" style="{header_style}">'
             f'{safe_html(cell)}'
@@ -240,7 +264,6 @@ def table_to_html(rows, number):
     output.append("</tr></thead>")
     output.append("<tbody>")
 
-    # 본문 셀
     for row_index, row in enumerate(rows[1:]):
 
         output.append("<tr>")
@@ -249,11 +272,9 @@ def table_to_html(rows, number):
 
             style = cell_style
 
-            # 첫 번째 열은 왼쪽 정렬
             if col_index == 0:
                 style += "text-align:left;font-weight:500;"
 
-            # 행마다 은은한 배경색 적용
             if row_index % 2 == 1:
                 style += "background-color:#f2f5f8;"
 
@@ -273,16 +294,20 @@ def table_to_html(rows, number):
 
 
 # ============================================================
-# 5. 표 검출
+# 6. 표 검출
 # ============================================================
 
 def detect_tables(page):
+
     results = []
 
     for strategy in ["lines", "text"]:
 
         try:
-            finder = page.find_tables(strategy=strategy)
+
+            finder = page.find_tables(
+                strategy=strategy
+            )
 
             for table in finder.tables:
 
@@ -291,11 +316,13 @@ def detect_tables(page):
                 if rect.width < 70 or rect.height < 30:
                     continue
 
-                if any(
+                duplicate = any(
                     overlap_ratio(rect, old["rect"]) > 0.75
                     or overlap_ratio(old["rect"], rect) > 0.75
                     for old in results
-                ):
+                )
+
+                if duplicate:
                     continue
 
                 try:
@@ -306,12 +333,14 @@ def detect_tables(page):
                     rows = []
 
                 try:
+
                     header = table.header
 
                     if (
                         getattr(header, "external", False)
                         and getattr(header, "names", None)
                     ):
+
                         names = [
                             clean_text(x)
                             for x in header.names
@@ -343,13 +372,15 @@ def detect_tables(page):
 
 
 # ============================================================
-# 6. 사진·이미지 검출
+# 7. 사진 및 이미지 검출
 # ============================================================
 
 def detect_images(page, table_regions):
+
     results = []
 
     try:
+
         for info in page.get_image_info(xrefs=True):
 
             bbox = info.get("bbox")
@@ -381,16 +412,22 @@ def detect_images(page, table_regions):
 
 
 # ============================================================
-# 7. 벡터 그래프 검출
+# 8. 벡터 그래프 검출
 # ============================================================
 
-def detect_vector_graphs(page, table_regions, image_regions):
+def detect_vector_graphs(
+    page,
+    table_regions,
+    image_regions
+):
+
     results = []
 
     if not hasattr(page, "cluster_drawings"):
         return results
 
     try:
+
         clusters = page.cluster_drawings(
             x_tolerance=8,
             y_tolerance=8
@@ -428,38 +465,66 @@ def detect_vector_graphs(page, table_regions, image_regions):
 
 
 # ============================================================
-# 8. 그래프 영역 합치기
+# 9. 그래프 영역 병합
+#    ★ 인접한 좌우 그래프는 병합하지 않음
 # ============================================================
 
 def merge_graph_regions(regions):
+
     merged = []
 
-    for item in sorted(
+    regions = sorted(
         regions,
-        key=lambda x: x["rect"].y0
-    ):
+        key=lambda x: (
+            x["rect"].x0,
+            x["rect"].y0
+        )
+    )
+
+    for item in regions:
 
         rect = fitz.Rect(item["rect"])
+
         matched = False
 
         for old in merged:
 
             old_rect = old["rect"]
 
-            expanded = fitz.Rect(
-                old_rect.x0 - 55,
-                old_rect.y0 - 55,
-                old_rect.x1 + 55,
-                old_rect.y1 + 55
+            intersection_width = max(
+                0,
+                min(rect.x1, old_rect.x1)
+                - max(rect.x0, old_rect.x0)
             )
 
-            if expanded.intersects(rect):
+            min_width = max(
+                1,
+                min(rect.width, old_rect.width)
+            )
+
+            x_overlap = (
+                intersection_width / min_width
+            )
+
+            vertical_gap = max(
+                0,
+                max(rect.y0, old_rect.y0)
+                - min(rect.y1, old_rect.y1)
+            )
+
+            # 가로 겹침이 충분하고 세로 간격이 가까울 때만 병합
+            if (
+                x_overlap >= 0.75
+                and vertical_gap <= 18
+            ):
 
                 old["rect"] |= rect
+
                 matched = True
                 break
 
         if not matched:
+
             merged.append({
                 "rect": rect,
                 "kind": "graph",
@@ -470,10 +535,16 @@ def merge_graph_regions(regions):
 
 
 # ============================================================
-# 9. 그래프 축 라벨 포함
+# 10. 그래프 축 데이터 수집
+#     ★ 옆 그래프의 제목·데이터가 들어오지 않도록 제한
 # ============================================================
 
-def attach_chart_labels(page, graph_regions, table_regions):
+def attach_chart_labels(
+    page,
+    graph_regions,
+    table_regions
+):
+
     blocks = page.get_text(
         "dict",
         sort=True
@@ -481,13 +552,15 @@ def attach_chart_labels(page, graph_regions, table_regions):
 
     for graph in graph_regions:
 
-        original = graph["rect"]
+        original = fitz.Rect(
+            graph["rect"]
+        )
 
         search_rect = fitz.Rect(
-            original.x0 - 65,
-            original.y0 - 75,
-            original.x1 + 65,
-            original.y1 + 75
+            original.x0 - 15,
+            original.y0 - 42,
+            original.x1 + 15,
+            original.y1 + 20
         ) & page.rect
 
         for block in blocks:
@@ -497,7 +570,9 @@ def attach_chart_labels(page, graph_regions, table_regions):
 
             for line in block.get("lines", []):
 
-                line_rect = fitz.Rect(line["bbox"])
+                line_rect = fitz.Rect(
+                    line["bbox"]
+                )
 
                 center = fitz.Point(
                     (line_rect.x0 + line_rect.x1) / 2,
@@ -529,6 +604,20 @@ def attach_chart_labels(page, graph_regions, table_regions):
                 ):
                     continue
 
+                belongs_to_other_graph = False
+
+                for other in graph_regions:
+
+                    if other is graph:
+                        continue
+
+                    if other["rect"].contains(center):
+                        belongs_to_other_graph = True
+                        break
+
+                if belongs_to_other_graph:
+                    continue
+
                 graph["rect"] |= line_rect
 
     for graph in graph_regions:
@@ -538,10 +627,11 @@ def attach_chart_labels(page, graph_regions, table_regions):
 
 
 # ============================================================
-# 10. 시각자료 중복 제거
+# 11. 시각자료 중복 제거
 # ============================================================
 
 def deduplicate_visuals(regions):
+
     selected = []
 
     regions = sorted(
@@ -581,18 +671,23 @@ def deduplicate_visuals(regions):
 
 
 # ============================================================
-# 11. PDF 영역 캡처
+# 12. 이미지 캡처
+#     ★ 여백 최소화
 # ============================================================
 
 def capture_pdf_region(page, rect, dpi):
+
     rect = expand_rect(
         rect,
         page.rect,
-        margin=4
+        margin=1
     )
 
     pix = page.get_pixmap(
-        matrix=fitz.Matrix(dpi / 72, dpi / 72),
+        matrix=fitz.Matrix(
+            dpi / 72,
+            dpi / 72
+        ),
         clip=rect,
         colorspace=fitz.csRGB,
         alpha=False,
@@ -603,10 +698,11 @@ def capture_pdf_region(page, rect, dpi):
 
 
 # ============================================================
-# 12. 본문 텍스트 추출
+# 13. 본문 텍스트 추출
 # ============================================================
 
 def extract_text_lines(page):
+
     data = page.get_text(
         "dict",
         sort=True
@@ -647,6 +743,7 @@ def extract_text_lines(page):
 
 
 def line_inside_visual(line_rect, regions):
+
     center = fitz.Point(
         (line_rect.x0 + line_rect.x1) / 2,
         (line_rect.y0 + line_rect.y1) / 2
@@ -666,6 +763,7 @@ def line_inside_visual(line_rect, regions):
 
 
 def text_line_to_html(text, font_size):
+
     safe = safe_html(text)
 
     if len(text) < 65 and font_size >= 13:
@@ -675,7 +773,7 @@ def text_line_to_html(text, font_size):
 
 
 # ============================================================
-# 13. EPUB CSS
+# 14. EPUB CSS
 # ============================================================
 
 EPUB_CSS = """
@@ -711,7 +809,8 @@ p {
     text-align: justify;
 }
 
-/* 표 전체 */
+/* 실제 표 */
+
 .table-scroll {
     display: block;
     width: 100%;
@@ -722,7 +821,6 @@ p {
     page-break-inside: avoid;
 }
 
-/* 표 바깥 테두리 */
 .report-table {
     border-collapse: collapse !important;
     border-spacing: 0 !important;
@@ -734,7 +832,6 @@ p {
     line-height: 1.55;
 }
 
-/* 가로·세로 셀 실선 */
 .report-table th,
 .report-table td {
     border: 1px solid #555555 !important;
@@ -746,7 +843,6 @@ p {
     writing-mode: horizontal-tb !important;
 }
 
-/* 헤더 */
 .report-table th {
     background-color: #e8edf2 !important;
     color: #172331;
@@ -755,19 +851,20 @@ p {
     border-bottom: 2px solid #333333 !important;
 }
 
-/* 첫 번째 열 */
 .report-table td:first-child {
     text-align: left;
     font-weight: 500;
 }
 
-/* 행 구분 배경 */
 .report-table tbody tr:nth-child(even) {
     background-color: #f2f5f8;
 }
 
-/* 그래프·사진 */
+/* 그래프 및 이미지 */
+
 .visual {
+    display: block;
+    width: 100%;
     margin: 1.2em 0;
     text-align: center;
     page-break-inside: avoid;
@@ -791,7 +888,7 @@ p {
 
 
 # ============================================================
-# 14. PDF → EPUB 변환
+# 15. PDF → EPUB 변환
 # ============================================================
 
 def convert_pdf_to_epub(
@@ -803,6 +900,8 @@ def convert_pdf_to_epub(
 ):
 
     doc = fitz.open(pdf_path)
+
+    total_pages = len(doc)
 
     book = epub.EpubBook()
 
@@ -821,6 +920,7 @@ def convert_pdf_to_epub(
     book.add_item(css_item)
 
     chapters = []
+
     actual_tables = 0
     image_tables = 0
     image_count = 0
@@ -828,7 +928,10 @@ def convert_pdf_to_epub(
     skipped_pages = []
     warnings = []
 
-    for page_index in range(len(doc)):
+    # 이미지 파일명 충돌 방지용 번호
+    image_serial = 0
+
+    for page_index in range(total_pages):
 
         page = doc[page_index]
         page_number = page_index + 1
@@ -839,38 +942,40 @@ def convert_pdf_to_epub(
             skip_financial
             and is_financial_statement(page_text)
         ):
+
             skipped_pages.append(page_number)
             continue
 
         elements = []
 
-        # 표
+        # 표 검출
         table_regions = detect_tables(page)
 
-        # 이미지
+        # 사진·이미지 검출
         image_regions = detect_images(
             page,
             table_regions
         )
 
-        # 그래프
+        # 벡터 그래프 검출
         graph_regions = detect_vector_graphs(
             page,
             table_regions,
             image_regions
         )
 
+        # 그래프 영역 병합: 인접 그래프 분리 유지
         graph_regions = merge_graph_regions(
             graph_regions
         )
 
+        # 그래프 축 데이터 추가
         graph_regions = attach_chart_labels(
             page,
             graph_regions,
             table_regions
         )
 
-        # 모든 시각자료 통합
         visual_regions = (
             table_regions
             + image_regions
@@ -915,17 +1020,18 @@ def convert_pdf_to_epub(
                         dpi
                     )
 
+                    image_serial += 1
                     image_count += 1
                     image_tables += 1
 
                     image_name = (
                         f"Images/table_{page_number}_"
-                        f"{image_count}.png"
+                        f"{image_serial}.png"
                     )
 
                     book.add_item(
                         epub.EpubItem(
-                            uid=f"table_{image_count}",
+                            uid=f"table_{image_serial}",
                             file_name=image_name,
                             media_type="image/png",
                             content=image_bytes
@@ -934,7 +1040,7 @@ def convert_pdf_to_epub(
 
                     relative_path = (
                         f"../Images/table_{page_number}_"
-                        f"{image_count}.png"
+                        f"{image_serial}.png"
                     )
 
                     elements.append({
@@ -949,6 +1055,7 @@ def convert_pdf_to_epub(
                     })
 
                 except Exception as error:
+
                     warnings.append(
                         f"{page_number}페이지 표 오류: {error}"
                     )
@@ -972,16 +1079,17 @@ def convert_pdf_to_epub(
                     dpi
                 )
 
+                image_serial += 1
                 image_count += 1
 
                 image_name = (
                     f"Images/visual_{page_number}_"
-                    f"{image_count}.png"
+                    f"{image_serial}.png"
                 )
 
                 book.add_item(
                     epub.EpubItem(
-                        uid=f"visual_{image_count}",
+                        uid=f"visual_{image_serial}",
                         file_name=image_name,
                         media_type="image/png",
                         content=image_bytes
@@ -990,7 +1098,7 @@ def convert_pdf_to_epub(
 
                 relative_path = (
                     f"../Images/visual_{page_number}_"
-                    f"{image_count}.png"
+                    f"{image_serial}.png"
                 )
 
                 elements.append({
@@ -1005,12 +1113,13 @@ def convert_pdf_to_epub(
                 })
 
             except Exception as error:
+
                 warnings.append(
                     f"{page_number}페이지 이미지 오류: {error}"
                 )
 
         # ----------------------------------------------------
-        # 본문 추출
+        # 본문 추출 및 중복 방지
         # ----------------------------------------------------
 
         for line in extract_text_lines(page):
@@ -1031,11 +1140,14 @@ def convert_pdf_to_epub(
             })
 
         # ----------------------------------------------------
-        # 페이지 순서 정렬
+        # 원본 위치 순서대로 배치
         # ----------------------------------------------------
 
         elements.sort(
-            key=lambda x: (x["y"], x["x"])
+            key=lambda x: (
+                x["y"],
+                x["x"]
+            )
         )
 
         page_content = (
@@ -1048,7 +1160,7 @@ def convert_pdf_to_epub(
             page_content += item["html"]
 
         # ----------------------------------------------------
-        # EPUB 페이지 생성
+        # EPUB 챕터 생성
         # ----------------------------------------------------
 
         chapter = epub.EpubHtml(
@@ -1078,7 +1190,7 @@ def convert_pdf_to_epub(
         book.add_item(chapter)
         chapters.append(chapter)
 
-    # 목차
+    # 목차 및 EPUB 구조
     book.toc = tuple(chapters)
 
     book.add_item(epub.EpubNcx())
@@ -1094,9 +1206,7 @@ def convert_pdf_to_epub(
     doc.close()
 
     return {
-        "total_pages": len(doc) if not doc.is_closed else (
-            len(chapters) + len(skipped_pages)
-        ),
+        "total_pages": total_pages,
         "converted_pages": len(chapters),
         "actual_tables": actual_tables,
         "image_tables": image_tables,
@@ -1107,7 +1217,7 @@ def convert_pdf_to_epub(
 
 
 # ============================================================
-# 15. 사용자 화면
+# 16. 사용자 화면
 # ============================================================
 
 uploaded_file = st.file_uploader(
@@ -1133,8 +1243,8 @@ skip_financial = st.checkbox(
 
 st.info(
     "권장 설정: 400 DPI. "
-    "표를 재구성할 수 있으면 실제 HTML 표로 변환하고, "
-    "복잡한 표는 원본 이미지로 보존합니다."
+    "표는 가능한 경우 실제 HTML 표로 재구성하며, "
+    "복잡한 표와 그래프는 원본 이미지로 보존합니다."
 )
 
 
@@ -1182,25 +1292,37 @@ if uploaded_file is not None:
             col1, col2 = st.columns(2)
 
             col1.metric(
-                "변환 페이지",
-                result["converted_pages"]
+                "전체 페이지",
+                result["total_pages"]
             )
 
             col2.metric(
-                "실제 EPUB 표",
-                result["actual_tables"]
+                "변환 페이지",
+                result["converted_pages"]
             )
 
             col3, col4 = st.columns(2)
 
             col3.metric(
+                "실제 EPUB 표",
+                result["actual_tables"]
+            )
+
+            col4.metric(
                 "이미지 표",
                 result["image_tables"]
             )
 
-            col4.metric(
+            col5, col6 = st.columns(2)
+
+            col5.metric(
                 "그래프·사진 이미지",
                 result["images"]
+            )
+
+            col6.metric(
+                "생략 페이지",
+                len(result["skipped_pages"])
             )
 
             if result["skipped_pages"]:
